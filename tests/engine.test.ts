@@ -1,0 +1,40 @@
+// Run: npm test. Covers the priority safety cases from the brief.
+import { buildSeed } from '../src/seed';
+import { startExecution, runToPause, resumeAfterReview, dryRunTo } from '../src/engine';
+import { makeSvc, PermissionError } from '../src/services';
+import { validateWorkflow } from '../src/workflows';
+import { runRuleTests } from '../src/rules';
+import { useStore } from '../src/store';
+
+let pass = 0, fail = 0;
+const t = (name: string, fn: () => void) => { try { fn(); console.log('  ✓', name); pass++; } catch (e: any) { console.log('  ✗', name, '\n     ', e.message); fail++; } };
+const eq = (a: any, b: any, m = '') => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`${m} expected ${JSON.stringify(b)} got ${JSON.stringify(a)}`); };
+const ok = (c: any, m: string) => { if (!c) throw new Error(m); };
+const run = (db: any, pid: string) => { const wf = pid.startsWith('PT-F') ? 'wf-fls' : 'wf-med'; const { exec } = startExecution(db, wf, pid, { actorId: 'U-MGR', trigger: 'test' }); return runToPause(db, exec.id); };
+const path = (ex: any) => ex.runs.map((r: any) => r.nodeId).join('>');
+
+console.log('Scenario branching');
+const expected: Record<string, string> = { 'PT-F1': 'awaiting_approval', 'PT-F2': 'awaiting_information', 'PT-F3': 'awaiting_information', 'PT-F4': 'awaiting_approval', 'PT-F5': 'completed', 'PT-F6': 'completed', 'PT-M1': 'monitoring', 'PT-M2': 'awaiting_approval', 'PT-M3': 'awaiting_approval', 'PT-M4': 'awaiting_information', 'PT-M5': 'awaiting_information', 'PT-M6': 'completed', 'PT-M7': 'awaiting_information' };
+for (const [pid, st] of Object.entries(expected)) t(`${pid} → ${st}`, () => { const db = buildSeed(); const ex = run(db, pid); eq(ex.status, st, path(ex)); });
+
+console.log('Priority safety cases');
+t('Missing information never shows as complete', () => { const db = buildSeed(); const ex = run(db, 'PT-F2'); const d = ex.runs.find((r: any) => r.nodeId === 'f9'); eq(d.port, 'incomplete'); ok(!ex.runs.some((r: any) => r.nodeId === 'f14'), 'checklist reached'); const lab = ex.runs.find((r: any) => r.nodeId === 'f3'); eq(lab.output.value, null); });
+t('Outdated result routes to incomplete, not complete', () => { const db = buildSeed(); const ex = run(db, 'PT-F3'); eq(ex.runs.find((r: any) => r.nodeId === 'f9').port, 'incomplete'); });
+t('Failed interface never produces false reassurance', () => { const db = buildSeed(); db.integrations.find((a: any) => a.id === 'epic-lab').health = 'down'; const ex = run(db, 'PT-F1'); eq(ex.status, 'failed'); ok(!ex.runs.some((r: any) => ['f6', 'f9', 'f14', 'f15'].includes(r.nodeId)), 'reached rules after failure'); ok(db.tasks.some((x: any) => x.type === 'manual_fallback'), 'no fallback task'); });
+t('Degraded interface retries then succeeds', () => { const db = buildSeed(); db.integrations.find((a: any) => a.id === 'epic-lab').health = 'degraded'; const ex = run(db, 'PT-F1'); eq(ex.status, 'awaiting_approval'); ok(ex.retryLog.length === 3, 'retries logged ' + ex.retryLog.length); });
+t('Workflow does not bypass clinical approval', () => { const db = buildSeed(); const ex = run(db, 'PT-F1'); ok(!db.communications.some((c: any) => c.patientId === 'PT-F1'), 'letter drafted before approval'); ok(!db.tasks.some((x: any) => x.patientId === 'PT-F1' && x.type === 'appointment_coordination'), 'appointment task before approval'); eq(ex.status, 'awaiting_approval'); });
+t('Publish validation rejects an edge that bypasses the gate', () => { const db = buildSeed(); const v = db.workflows[0].versions[0]; const edges = [...v.edges, { id: 'x', source: 'f14', sourceHandle: 'out', target: 'f17' }]; ok(validateWorkflow(v.nodes, edges).some(i => i.msg.includes('without passing')), 'not detected'); eq(validateWorkflow(v.nodes, v.edges).filter(i => i.level === 'error').length, 0, 'published version has errors'); });
+t('Unauthorised user cannot approve clinical actions', () => { useStore.getState().reset(); const st = useStore.getState(); st.run('wf-fls', 'PT-F1'); const rev = st.db.reviews.find((r: any) => r.patientId === 'PT-F1' && r.status === 'awaiting'); useStore.setState({ userId: 'U-ADMIN' }); useStore.getState().decide(rev.id, 'authorise', 'x'); eq(rev.status, 'awaiting'); useStore.setState({ userId: 'U-PHARM' }); useStore.getState().decide(rev.id, 'authorise', 'x'); eq(rev.status, 'awaiting', 'pharmacist approved FLS'); ok(useStore.getState().db.audit.some((a: any) => a.action === 'permission.denied'), 'denial not audited'); useStore.setState({ userId: 'U-CLIN' }); useStore.getState().decide(rev.id, 'authorise', 'Reviewed'); eq(rev.status, 'decided'); const ex = useStore.getState().db.executions.find((e: any) => e.id === rev.executionId); eq(ex.status, 'completed'); });
+t('Repeated trigger does not duplicate an existing task', () => { const db = buildSeed(); run(db, 'PT-F2'); run(db, 'PT-F2'); eq(db.tasks.filter((x: any) => x.patientId === 'PT-F2' && x.type === 'information_request').length, 1); ok(db.audit.some((a: any) => a.action === 'task.duplicate_suppressed'), 'suppression not audited'); });
+t('Repeated trigger while awaiting approval reuses execution', () => { const db = buildSeed(); const a = run(db, 'PT-F1'); const { exec, reused } = startExecution(db, 'wf-fls', 'PT-F1', { actorId: 'U-MGR', trigger: 't' }); ok(reused && exec.id === a.id, 'duplicate execution'); });
+t('Workflow retries do not duplicate handovers', () => { const db = buildSeed(); run(db, 'PT-M1'); run(db, 'PT-M1'); eq(db.referrals.filter((r: any) => r.patientId === 'PT-M1').length, 1); });
+t('Failed external handover remains visible until resolved', () => { const db = buildSeed(); run(db, 'PT-M7'); run(db, 'PT-M7'); const ex = db.exceptions.filter((e: any) => e.patientId === 'PT-M7' && e.category === 'Referral delivery failure'); eq(ex.length, 1); eq(ex[0].status, 'open'); });
+t('AI output never triggers autonomous medication changes', () => { useStore.getState().reset(); const s = useStore.getState(); useStore.setState({ userId: 'U-MGR' }); s.setAiMode('synthetic'); const before = JSON.stringify(useStore.getState().db.medications); useStore.getState().aiDraft('PT-M3', 'med-handover', 'med-handover-v0.1'); eq(JSON.stringify(useStore.getState().db.medications), before); const c = useStore.getState().db.communications.find((x: any) => x.origin === 'ai'); eq(c.status, 'draft'); ok(c.uncertainties.length > 0, 'uncertainty not reported'); });
+t('Conflict detected and routed to pharmacist', () => { const db = buildSeed(); const ex = run(db, 'PT-M2'); eq(ex.runs.find((r: any) => r.nodeId === 'm8').port, 'conflict'); const rev = db.reviews.find((r: any) => r.id === ex.awaitingReview); eq(rev.requiredRole, 'pharmacist'); });
+t('Task cannot be completed without evidence', () => { const db = buildSeed(); const svc = makeSvc(db); let threw = false; try { svc.updateTask('TSK-0F5A', { status: 'completed' }, 'U-ADMIN', 'x'); } catch { threw = true; } ok(threw, 'completed without evidence'); });
+t('Audit chain is hash-linked', () => { const db = buildSeed(); run(db, 'PT-F1'); for (let i = 1; i < db.audit.length; i++) eq(db.audit[i].prevHash, db.audit[i - 1].hash); });
+t('Dry run is side-effect free and stops at gate', () => { const db = buildSeed(); const n = db.tasks.length; const v = db.workflows[0].versions[0]; const r = dryRunTo(db, 'wf-fls', 'PT-F1', 'f16', v); ok(!r.reached && r.stoppedBecause!.includes('approval'), 'passed gate'); eq(db.tasks.length, n); eq(db.executions.length, 0); });
+t('All rule test cases pass', () => { const db = buildSeed(); for (const r of db.rules) for (const x of runRuleTests(r)) ok(x.pass, `${r.id}: ${x.name} → ${JSON.stringify(x.out)}`); });
+t('Lab result re-evaluation progresses incomplete patient', () => { useStore.getState().reset(); useStore.setState({ userId: 'U-NURSE' }); useStore.getState().recordResult('PT-F2', 'VITD', 64); const ex = useStore.getState().db.executions.filter((e: any) => e.patientId === 'PT-F2').pop(); eq(ex.status, 'awaiting_approval'); });
+
+console.log(`\n${pass} passed, ${fail} failed`); if (fail) process.exit(1);

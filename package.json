@@ -1,0 +1,21 @@
+{
+  "name": "care-coordination-platform",
+  "version": "0.1.0",
+  "description": "Synthetic-data prototype: AI-enabled NHS clinical workflow and care coordination (FLS and medication safety)",
+  "scripts": {
+    "build": "esbuild src/main.tsx --bundle --minify --format=iife --outdir=dist --define:process.env.NODE_ENV='\"production\"' && python3 build.py",
+    "dev": "esbuild src/main.tsx --bundle --format=iife --outdir=dist --servedir=. --watch",
+    "test": "esbuild tests/engine.test.ts --bundle --platform=node --outfile=.tmp/test.cjs --log-level=warning && node .tmp/test.cjs"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "@xyflow/react": "^12.3.6",
+    "esbuild": "^0.23.1",
+    "lucide-react": "^0.383.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^2.12.7",
+    "zustand": "^4.5.5"
+  },
+  "private": true
+}
